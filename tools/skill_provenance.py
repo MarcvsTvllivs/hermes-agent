@@ -76,3 +76,36 @@ def is_background_review() -> bool:
     """Convenience: True iff the current write origin is the background
     review fork."""
     return get_current_write_origin() == BACKGROUND_REVIEW
+
+
+# ---------------------------------------------------------------------------
+# Curator-review guard — prevents permanent delete during curator LLM pass
+# ---------------------------------------------------------------------------
+
+_curator_review: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "curator_review", default=False
+)
+
+
+def mark_curator_review() -> contextvars.Token[bool]:
+    """Signal that the current context is a curator review fork.
+
+    Returns a Token the caller must pass to ``clear_curator_review``
+    in a ``finally`` block.
+    """
+    return _curator_review.set(True)
+
+
+def clear_curator_review(token: contextvars.Token[bool]) -> None:
+    """Restore the prior curator-review context."""
+    _curator_review.reset(token)
+
+
+def is_curator_review() -> bool:
+    """True when the current call originates from a curator review fork.
+
+    Used by ``skill_manage`` to refuse ``action='delete'`` (permanent loss)
+    during curator review passes — the curator must use ``action='archive'``
+    (recoverable move to ``.archive/``) instead.
+    """
+    return _curator_review.get()

@@ -147,24 +147,25 @@ def _is_path_redirect(path: Path) -> bool:
         return False
 
 
-def _validate_delete_target(skill_dir: Path) -> Optional[str]:
-    """Last-line guard before ``shutil.rmtree(skill_dir)`` in ``_delete_skill``.
+def _validate_removal_target(skill_dir: Path) -> Optional[str]:
+    """Last-line guard before removing ``skill_dir`` — ``shutil.rmtree`` in
+    ``_delete_skill`` or ``shutil.move`` in ``_archive_skill``.
 
     ``_find_skill`` already restricts ``skill_dir`` to a real ``SKILL.md``
     parent discovered by walking the skills roots, so the agent cannot inject
     an arbitrary path the way Kilo Code's HTTP endpoint could (their issue
     #11227: a built-in-skill sentinel resolved to the server cwd and a
     recursive delete wiped the user's entire working directory). This is the
-    matching defense-in-depth for our agent-facing ``skill_manage`` delete
-    path: even if discovery or a poisoned tree hands us a bad directory, never
-    recursively delete
+    matching defense-in-depth for our agent-facing ``skill_manage``
+    delete/archive path: even if discovery or a poisoned tree hands us a bad
+    directory, never remove or move
 
       1. a path that is not strictly *inside* one of the known skills roots,
       2. a skills root itself (would wipe every installed skill), or
-      3. a directory reached via a symlink / junction (``rmtree`` would follow
-         it into content outside the skills tree).
+      3. a directory reached via a symlink / junction (``rmtree``/``move``
+         would follow it into content outside the skills tree).
 
-    Returns an error string to refuse on, or ``None`` when the delete is safe.
+    Returns an error string to refuse on, or ``None`` when the removal is safe.
     """
     from agent.skill_utils import get_all_skills_dirs
 
@@ -892,7 +893,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     skills_root = _containing_skills_root(skill_dir)
 
     # Defense-in-depth before the recursive delete (port of Kilo Code #11240).
-    unsafe = _validate_delete_target(skill_dir)
+    unsafe = _validate_removal_target(skill_dir)
     if unsafe:
         return {"success": False, "error": unsafe}
 
@@ -911,6 +912,69 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         "success": True,
         "message": message,
     }
+
+
+def _archive_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
+    """Archive a skill — move to .archive/ (recoverable), never delete.
+
+    Mirrors the validation prologue of ``_delete_skill`` (pinned guard,
+    path-safety, absorbed_into checks) but calls
+    ``skill_usage.archive_skill()`` for the recoverable move + state update
+    instead of ``shutil.rmtree``. ``archive_skill()`` already enforces
+    curation-eligibility (refuses hub skills, bundled when prune_builtins is
+    off, protected built-ins), does the ``shutil.move`` to
+    ``~/.hermes/skills/.archive/``, and updates ``.usage.json`` state to
+    ``archived``.
+
+    ``absorbed_into`` works the same as in ``_delete_skill``: pass an
+    umbrella name when consolidating, empty string when truly pruning.
+    """
+    existing = _find_skill(name)
+    if not existing:
+        return {"success": False, "error": _skill_not_found_error(name)}
+
+    pinned_err = _pinned_guard(name)
+    if pinned_err:
+        return {"success": False, "error": pinned_err}
+
+    # Validate absorbed_into target when declared non-empty
+    if absorbed_into is not None and isinstance(absorbed_into, str) and absorbed_into.strip():
+        target_name = absorbed_into.strip()
+        if target_name == name:
+            return {
+                "success": False,
+                "error": f"absorbed_into='{target_name}' cannot equal the skill being archived.",
+            }
+        target = _find_skill(target_name)
+        if not target:
+            return {
+                "success": False,
+                "error": (
+                    f"absorbed_into='{target_name}' does not exist. "
+                    f"Create or patch the umbrella skill first, then retry the archive."
+                ),
+            }
+
+    skill_dir = existing["path"]
+    # Defense-in-depth before the move (same guard as delete, but archive
+    # moves rather than rmtree so the symlink/junction and out-of-tree
+    # guards are still load-bearing — a poisoned skill path that redirects
+    # outside the tree must not be fed to shutil.move either).
+    unsafe = _validate_removal_target(skill_dir)
+    if unsafe:
+        return {"success": False, "error": unsafe}
+
+    from tools.skill_usage import archive_skill
+    ok, msg = archive_skill(name)
+    if not ok:
+        return {"success": False, "error": msg}
+
+    # archive_skill returns "archived to <resolved dest>" — surface that real,
+    # profile-aware path rather than a hardcoded ~/.hermes/skills/.archive/.
+    message = f"Skill '{name}' {msg}."
+    if absorbed_into is not None and isinstance(absorbed_into, str) and absorbed_into.strip():
+        message += f" Content absorbed into '{absorbed_into.strip()}'."
+    return {"success": True, "message": message}
 
 
 def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
@@ -1031,7 +1095,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     write should NOT proceed (blocked or staged), or None to perform the real
     write. Bypassed during approved-pending replay.
     """
-    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+    if action not in {"create", "edit", "patch", "archive", "delete", "write_file", "remove_file"}:
         return None
     if _skill_gate_bypass.get():
         return None
@@ -1138,7 +1202,19 @@ def skill_manage(
             return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
         result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
+    elif action == "archive":
+        result = _archive_skill(name, absorbed_into=absorbed_into)
+
     elif action == "delete":
+        from tools.skill_provenance import is_curator_review
+        if is_curator_review():
+            return tool_error(
+                "skill_manage(action='delete') is not available during curator review. "
+                "Use action='archive' instead to move the skill to "
+                "~/.hermes/skills/.archive/ where it remains recoverable. "
+                "Restore it later with `hermes curator restore <name>`.",
+                success=False,
+            )
         result = _delete_skill(name, absorbed_into=absorbed_into)
 
     elif action == "write_file":
@@ -1154,7 +1230,7 @@ def skill_manage(
         result = _remove_file(name, file_path)
 
     else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, archive, delete, write_file, remove_file"}
 
     if result.get("success"):
         try:
@@ -1191,20 +1267,21 @@ def skill_manage(
 SKILL_MANAGE_SCHEMA = {
     "name": "skill_manage",
     "description": (
-        "Manage skills (create, update, delete). Skills are your procedural "
+        "Manage skills (create, update, archive, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
         f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
-        "delete, write_file, remove_file.\n\n"
-        "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
+        "archive (recoverable move to .archive/), "
+        "delete (permanent removal), write_file, remove_file.\n\n"
+        "On archive or delete, pass `absorbed_into=<umbrella>` when you're merging this "
         "skill's content into another one, or `absorbed_into=\"\"` when you're "
         "pruning it with no forwarding target. This lets the curator tell "
         "consolidation from pruning without guessing, so downstream consumers "
         "(cron jobs that reference the old skill name, etc.) get updated "
         "correctly. The target you name in `absorbed_into` must already "
-        "exist — create/patch the umbrella first, then delete.\n\n"
+        "exist — create/patch the umbrella first, then archive or delete.\n\n"
         "Create when: complex task succeeded (5+ calls), errors overcome, "
         "user-corrected approach worked, non-trivial workflow discovered, "
         "or user asks you to remember a procedure.\n"
@@ -1215,7 +1292,8 @@ SKILL_MANAGE_SCHEMA = {
         "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
         "pitfalls section, verification steps. Use skill_view() to see format examples.\n\n"
-        "Pinned skills are protected from deletion only — skill_manage(action='delete') "
+        "Pinned skills are protected from deletion and archival — skill_manage(action='archive') "
+        "and skill_manage(action='delete') "
         "will refuse with a message pointing the user to `hermes curator unpin <name>`. "
         "Patches and edits go through on pinned skills so you can still improve them as "
         "pitfalls come up; pin only guards against irrecoverable loss."
@@ -1225,14 +1303,14 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
-                "description": "The action to perform."
+                "enum": ["create", "patch", "edit", "archive", "delete", "write_file", "remove_file"],
+                "description": "The action to perform. Prefer 'archive' over 'delete' — archive is recoverable."
             },
             "name": {
                 "type": "string",
                 "description": (
                     "Skill name (lowercase, hyphens/underscores, max 64 chars). "
-                    "Must match an existing skill for patch/edit/delete/write_file/remove_file."
+                    "Must match an existing skill for patch/edit/archive/delete/write_file/remove_file."
                 )
             },
             "content": {
@@ -1286,7 +1364,7 @@ SKILL_MANAGE_SCHEMA = {
             "absorbed_into": {
                 "type": "string",
                 "description": (
-                    "For 'delete' only — declares intent so the curator can "
+                    "For 'archive' and 'delete' — declares intent so the curator can "
                     "tell consolidation from pruning without guessing. "
                     "Pass the umbrella skill name when this skill's content "
                     "was merged into another (the target must already exist). "

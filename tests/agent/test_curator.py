@@ -7,8 +7,10 @@ tests run fully offline and the curator module doesn't need real credentials.
 from __future__ import annotations
 
 import importlib
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1170,3 +1172,155 @@ def test_review_fork_runs_under_background_review_origin(curator_env, monkeypatc
         "'background_review' — the skill_manage background-review write "
         "guard would not fire (GH-47688 regression)"
     )
+# ---------------------------------------------------------------------------
+# _extract_absorbed_into_declarations — archive action parity
+# ---------------------------------------------------------------------------
+
+
+def test_extract_absorbed_into_from_archive_action():
+    """_extract_absorbed_into_declarations picks up action='archive' the same
+    as action='delete' — both carry absorbed_into for consolidation/prune
+    classification."""
+    from agent.curator import _extract_absorbed_into_declarations
+
+    calls = [
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "archive", "name": "narrow", "absorbed_into": "umbrella",
+        })},
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "archive", "name": "stale", "absorbed_into": "",
+        })},
+    ]
+    out = _extract_absorbed_into_declarations(calls)
+    assert out["narrow"]["into"] == "umbrella"
+    assert out["narrow"]["declared"] is True
+    assert out["stale"]["into"] == ""
+    assert out["stale"]["declared"] is True
+
+
+def test_extract_absorbed_into_from_delete_action_still_works():
+    """Legacy action='delete' calls with absorbed_into are still recognized."""
+    from agent.curator import _extract_absorbed_into_declarations
+
+    calls = [
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "delete", "name": "narrow", "absorbed_into": "umbrella",
+        })},
+    ]
+    out = _extract_absorbed_into_declarations(calls)
+    assert out["narrow"]["into"] == "umbrella"
+
+
+def test_extract_absorbed_into_ignores_other_actions():
+    """Only archive/delete actions are inspected — create/patch/etc. are skipped."""
+    from agent.curator import _extract_absorbed_into_declarations
+
+    calls = [
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "create", "name": "narrow", "absorbed_into": "umbrella",
+        })},
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "patch", "name": "narrow", "absorbed_into": "umbrella",
+        })},
+    ]
+    out = _extract_absorbed_into_declarations(calls)
+    assert out == {}
+
+
+# ---------------------------------------------------------------------------
+# curator review ContextVar — delete blocked during curator LLM pass
+# ---------------------------------------------------------------------------
+
+
+def test_run_llm_review_sets_curator_review_context():
+    """_run_llm_review must set the curator-review ContextVar so skill_manage
+    refuses action='delete' during the curator's LLM consolidation pass."""
+    from agent import curator as c
+    from tools.skill_provenance import is_curator_review
+
+    # Use a shallow stub that captures whether the ContextVar was set while
+    # the simulated agent runs.
+    review_captured = {}
+
+    class _FakeAgent:
+        def run_conversation(self, user_message):
+            review_captured["curator_review_set"] = is_curator_review()
+            return {"final_response": "ok"}
+
+        def close(self):
+            pass
+
+    def _fake_agent(*args, **kwargs):
+        return _FakeAgent()
+
+    with patch("run_agent.AIAgent", _fake_agent), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={}), \
+         patch("hermes_cli.config.load_config", return_value={"model": {"provider": "test", "default": "m"}}):
+        c._run_llm_review("test prompt")
+
+    assert review_captured.get("curator_review_set") is True, (
+        "curator-review ContextVar must be True while the review agent runs"
+    )
+
+    # ContextVar must reset after _run_llm_review returns
+    assert is_curator_review() is False, (
+        "curator-review ContextVar must be False after _run_llm_review returns"
+    )
+
+
+def test_run_llm_review_clears_curator_review_on_error():
+    """ContextVar must be cleared even when the agent raises."""
+    from agent import curator as c
+    from tools.skill_provenance import is_curator_review
+
+    class _CrashingAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run_conversation(self, user_message):
+            raise RuntimeError("simulated crash")
+
+        def close(self):
+            pass
+
+    def _fake_agent(*args, **kwargs):
+        return _CrashingAgent()
+
+    with patch("run_agent.AIAgent", _fake_agent), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={}), \
+         patch("hermes_cli.config.load_config", return_value={"model": {"provider": "test", "default": "m"}}):
+        result = c._run_llm_review("test prompt")
+
+    assert result["error"] is not None
+    # ContextVar must still be cleared after the error
+    assert is_curator_review() is False, (
+        "curator-review ContextVar must be False after _run_llm_review "
+        "even when the agent crashes"
+    )
+
+
+def test_curator_review_prompt_references_archive_action():
+    """The curator prompt must tell the LLM to use action=archive (not delete)."""
+    from agent.curator import CURATOR_REVIEW_PROMPT
+    assert "action=archive" in CURATOR_REVIEW_PROMPT, (
+        "curator prompt must tell the LLM to use action=archive"
+    )
+    # The toolset section must offer action=archive as the archival primitive,
+    # not action=delete. "action=delete" may still appear in prohibition rules
+    # (e.g. "skill_manage action=delete is permanently blocked"), but it must
+    # NOT appear as "skill_manage action=delete" in the toolset listing.
+    # Check that the line specifically offering the archive tool uses archive:
+    lines = CURATOR_REVIEW_PROMPT.split("\n")
+    tool_lines = [l.strip() for l in lines if "skill_manage action=" in l]
+    # At least one tool line must reference archive
+    archive_lines = [l for l in tool_lines if "action=archive" in l]
+    assert len(archive_lines) >= 1, (
+        "curator prompt must list skill_manage action=archive in the toolset"
+    )
+    # No tool line should reference delete as a positive instruction
+    for line in tool_lines:
+        if "action=delete" in line:
+            # Only allowed if it appears in a prohibition context
+            assert "blocked" in line.lower() or "do not" in line.lower(), (
+                f"curator prompt must not offer action=delete as a usable tool: {line}"
+            )

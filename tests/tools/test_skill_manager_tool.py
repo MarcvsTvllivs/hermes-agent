@@ -1,6 +1,7 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
 import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from tools.skill_manager_tool import (
     _edit_skill,
     _patch_skill,
     _delete_skill,
+    _archive_skill,
     _write_file,
     _remove_file,
     skill_manage,
@@ -387,8 +389,8 @@ class TestDeleteSkill:
 
     def test_delete_with_absorbed_into_valid_target(self, tmp_path):
         with _skill_dir(tmp_path):
-            _create_skill("umbrella", VALID_SKILL_CONTENT)
-            _create_skill("narrow", VALID_SKILL_CONTENT)
+            _create_skill("umbrella", _content_for("umbrella"))
+            _create_skill("narrow", _content_for("narrow"))
             result = _delete_skill("narrow", absorbed_into="umbrella")
         assert result["success"] is True
         assert "absorbed into 'umbrella'" in result["message"]
@@ -397,7 +399,7 @@ class TestDeleteSkill:
 
     def test_delete_with_absorbed_into_empty_string_means_pruned(self, tmp_path):
         with _skill_dir(tmp_path):
-            _create_skill("stale-skill", VALID_SKILL_CONTENT)
+            _create_skill("stale-skill", _content_for("stale-skill"))
             result = _delete_skill("stale-skill", absorbed_into="")
         assert result["success"] is True
         # Empty absorbed_into is explicit prune — no "absorbed into" suffix in message
@@ -1091,3 +1093,240 @@ class TestDeleteSkillRmtreeGuard:
         assert result["success"] is False
         assert "skills root" in result["error"].lower()
         assert outside.exists()
+
+
+# ---------------------------------------------------------------------------
+# archive skill — recoverable move to .archive/ (curator safety)
+# ---------------------------------------------------------------------------
+
+
+def _content_for(name: str) -> str:
+    """Generate VALID_SKILL_CONTENT with the correct frontmatter `name:`."""
+    return VALID_SKILL_CONTENT.replace("name: test-skill", f"name: {name}")
+
+
+@contextmanager
+def _archive_env(tmp_path):
+    """Patch BOTH SKILLS_DIR (for _find_skill) AND get_hermes_home (for archive_skill).
+
+    archive_skill() in skill_usage locates skills via get_hermes_home()/skills/,
+    not via SKILLS_DIR. Both must point to the same temp tree.
+    """
+    home = tmp_path / ".hermes"
+    skills = home / "skills"
+    skills.mkdir(parents=True)
+
+    # Patch get_hermes_home at the source (hermes_constants) so every
+    # module that calls it — including skill_usage after reload — sees
+    # the temp path. Also patch SKILLS_DIR for _find_skill.
+    with patch("hermes_constants.get_hermes_home", return_value=home), \
+         patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \
+         patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        yield {"home": home, "skills": skills}
+
+
+class TestArchiveSkill:
+    def test_archive_moves_to_archive_dir(self, tmp_path):
+        with _archive_env(tmp_path) as env:
+            _create_skill("my-skill", _content_for("my-skill"))
+            result = _archive_skill("my-skill")
+            assert result["success"] is True, result
+            assert "archived" in result["message"].lower()
+            # Skill dir moved to .archive/
+            assert not (env["skills"] / "my-skill").exists()
+            assert (env["skills"] / ".archive" / "my-skill" / "SKILL.md").exists()
+            # .usage.json state set to "archived"
+            from tools import skill_usage
+            rec = skill_usage.get_record("my-skill")
+            assert rec["state"] == "archived"
+
+    def test_archive_nonexistent_skill(self, tmp_path):
+        with _archive_env(tmp_path):
+            result = _archive_skill("nonexistent")
+        assert result["success"] is False
+        assert "not found" in result["error"]
+
+    def test_archive_refuses_pinned(self, tmp_path):
+        from tools import skill_usage
+        with _archive_env(tmp_path) as env:
+            _create_skill("my-skill", _content_for("my-skill"))
+            data = skill_usage.load_usage()
+            data["my-skill"] = skill_usage._empty_record()
+            data["my-skill"]["pinned"] = True
+            skill_usage.save_usage(data)
+            result = _archive_skill("my-skill")
+        assert result["success"] is False
+        assert "pinned" in result["error"].lower()
+        assert "cannot be deleted" in result["error"]
+        # Skill still in place
+        assert (env["skills"] / "my-skill" / "SKILL.md").exists()
+
+    def test_archive_with_absorbed_into_valid_target(self, tmp_path):
+        with _archive_env(tmp_path) as env:
+            _create_skill("umbrella", _content_for("umbrella"))
+            _create_skill("narrow", _content_for("narrow"))
+            result = _archive_skill("narrow", absorbed_into="umbrella")
+        assert result["success"] is True, result
+        assert "absorbed into 'umbrella'" in result["message"]
+        assert not (env["skills"] / "narrow").exists()
+        assert (env["skills"] / "umbrella").exists()
+
+    def test_archive_with_absorbed_into_empty_string_means_pruned(self, tmp_path):
+        with _archive_env(tmp_path) as env:
+            _create_skill("stale-skill", _content_for("stale-skill"))
+            result = _archive_skill("stale-skill", absorbed_into="")
+        assert result["success"] is True, result
+        assert "absorbed into" not in result["message"]
+
+    def test_archive_with_absorbed_into_nonexistent_target_rejected(self, tmp_path):
+        with _archive_env(tmp_path) as env:
+            _create_skill("narrow", _content_for("narrow"))
+            result = _archive_skill("narrow", absorbed_into="ghost-umbrella")
+        assert result["success"] is False
+        assert "does not exist" in result["error"]
+        assert (env["skills"] / "narrow").exists()
+
+    def test_archive_with_absorbed_into_equals_self_rejected(self, tmp_path):
+        with _archive_env(tmp_path) as env:
+            _create_skill("narrow", _content_for("narrow"))
+            result = _archive_skill("narrow", absorbed_into="narrow")
+        assert result["success"] is False
+        assert "cannot equal" in result["error"]
+        assert (env["skills"] / "narrow").exists()
+
+    def test_archive_via_dispatcher(self, tmp_path):
+        with _archive_env(tmp_path) as env:
+            skill_manage(action="create", name="my-skill", content=_content_for("my-skill"))
+            raw = skill_manage(action="archive", name="my-skill", absorbed_into="")
+        result = json.loads(raw)
+        assert result["success"] is True, result
+        assert "archived" in result["message"].lower()
+        assert not (env["skills"] / "my-skill").exists()
+        assert (env["skills"] / ".archive" / "my-skill").exists()
+
+    def test_archive_refuses_bundled_when_prune_builtins_off(self, tmp_path):
+        """Proves _archive_skill reuses archive_skill() rather than a parallel
+        mover — archive_skill() refuses bundled skills when prune_builtins is off."""
+        with _archive_env(tmp_path) as env:
+            _create_skill("bundled-skill", _content_for("bundled-skill"))
+            (env["skills"] / ".bundled_manifest").write_text(
+                "bundled-skill:abc\n", encoding="utf-8"
+            )
+            # archive_skill() calls _prune_builtins_enabled() which defaults
+            # to True. Patch it to False so bundled skills are refused.
+            with patch("tools.skill_usage._prune_builtins_enabled", return_value=False):
+                result = _archive_skill("bundled-skill")
+        assert result["success"] is False
+        assert "bundled" in result["error"].lower()
+        assert (env["skills"] / "bundled-skill").exists()
+
+    def test_archive_refuses_protected_builtin(self, tmp_path):
+        """Protected built-ins (e.g. plan) are never archivable."""
+        from tools.skill_usage import PROTECTED_BUILTIN_SKILLS
+        name = next(iter(PROTECTED_BUILTIN_SKILLS))
+        with _archive_env(tmp_path) as env:
+            _create_skill(name, _content_for(name))
+            (env["skills"] / ".bundled_manifest").write_text(
+                f"{name}:abc\n", encoding="utf-8"
+            )
+            result = _archive_skill(name)
+        assert result["success"] is False
+        assert "protected" in result["error"].lower()
+        assert (env["skills"] / name).exists()
+
+    def test_archive_preserves_usage_record(self, tmp_path):
+        """archive_skill updates state to 'archived' — it does NOT drop the record.
+
+        Uses skill_manage(action='archive') through the dispatcher to exercise the
+        full path. The state update happens inside archive_skill() in skill_usage."""
+        with _archive_env(tmp_path) as env:
+            # Create via dispatcher so the skill is properly written
+            skill_manage(action="create", name="my-skill", content=_content_for("my-skill"))
+            # Set up usage manually
+            import tools.skill_usage as su
+            data = su.load_usage()
+            data["my-skill"] = su._empty_record()
+            data["my-skill"]["created_by"] = "agent"
+            data["my-skill"]["use_count"] = 5
+            su.save_usage(data)
+
+            raw = skill_manage(action="archive", name="my-skill", absorbed_into="")
+            result = json.loads(raw)
+            assert result["success"] is True, result
+            rec = su.get_record("my-skill")
+            assert rec["state"] == "archived"
+            assert rec["created_by"] == "agent"
+            assert rec["use_count"] == 5
+            assert rec["archived_at"] is not None
+            # forget() was NOT called — record exists with preserved fields
+            assert "my-skill" in su.load_usage()
+
+
+# ---------------------------------------------------------------------------
+# Curator review gate — skill_manage(action='delete') refused during curator pass
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorReviewDeleteGate:
+    def test_delete_blocked_during_curator_review(self, tmp_path):
+        """action='delete' must be rejected when is_curator_review() is True."""
+        from tools.skill_provenance import mark_curator_review, clear_curator_review
+
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", _content_for("my-skill"))
+            token = mark_curator_review()
+            try:
+                raw = skill_manage(action="delete", name="my-skill")
+            finally:
+                clear_curator_review(token)
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "not available during curator review" in result["error"]
+        assert "action='archive'" in result["error"]
+        # Skill must NOT have been deleted
+        assert (tmp_path / "my-skill" / "SKILL.md").exists()
+
+    def test_archive_allowed_during_curator_review(self, tmp_path):
+        """action='archive' must succeed when is_curator_review() is True."""
+        from tools.skill_provenance import mark_curator_review, clear_curator_review
+
+        with _archive_env(tmp_path) as env:
+            _create_skill("my-skill", _content_for("my-skill"))
+            token = mark_curator_review()
+            try:
+                raw = skill_manage(action="archive", name="my-skill", absorbed_into="")
+            finally:
+                clear_curator_review(token)
+
+        result = json.loads(raw)
+        assert result["success"] is True, result
+        assert "archived" in result["message"].lower()
+        assert not (env["skills"] / "my-skill").exists()
+
+    def test_delete_allowed_outside_curator_review(self, tmp_path):
+        """action='delete' must still work when NOT in curator review."""
+        from tools.skill_provenance import is_curator_review
+        # Default is False — no token set
+        assert is_curator_review() is False
+
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", _content_for("my-skill"))
+            raw = skill_manage(action="delete", name="my-skill")
+        result = json.loads(raw)
+        assert result["success"] is True, result
+        assert not (tmp_path / "my-skill").exists()
+
+    def test_clear_curator_review_restores_default(self):
+        """After clear_curator_review, is_curator_review returns False."""
+        from tools.skill_provenance import (
+            mark_curator_review, clear_curator_review, is_curator_review,
+        )
+        assert is_curator_review() is False
+        token = mark_curator_review()
+        try:
+            assert is_curator_review() is True
+        finally:
+            clear_curator_review(token)
+        assert is_curator_review() is False

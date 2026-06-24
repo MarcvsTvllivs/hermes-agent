@@ -381,9 +381,10 @@ CURATOR_REVIEW_PROMPT = (
     "(`skills.external_dirs`). The candidate list below is already filtered "
     "to local curator-managed skills only; external skills are externally "
     "owned and read-only to this background curator.\n"
-    "2. DO NOT delete any skill. Archiving (moving the skill's directory "
-    "into ~/.hermes/skills/.archive/) is the maximum destructive action. "
-    "Archives are recoverable; deletion is not.\n"
+    "2. DO NOT delete any skill. Use skill_manage action=archive (which "
+    "moves the skill's directory into ~/.hermes/skills/.archive/). "
+    "skill_manage action=delete is permanently blocked during curator "
+    "review. Archives are recoverable; deletion is not.\n"
     "3. DO NOT touch skills shown as pinned=yes. Skip them entirely.\n"
     "3b. DO NOT archive, delete, consolidate, move, or otherwise modify any "
     "skill named in the protected built-ins list (currently: plan). These "
@@ -466,7 +467,7 @@ CURATOR_REVIEW_PROMPT = (
     "  - skill_manage action=write_file — add a references/, templates/, "
     "or scripts/ file under an existing skill (the skill must already "
     "exist)\n"
-    "  - skill_manage action=delete     — archive a skill. MUST pass "
+    "  - skill_manage action=archive    — archive a skill. MUST pass "
     "`absorbed_into=<umbrella>` when you've merged its content into another "
     "skill, or `absorbed_into=\"\"` when you're truly pruning with no "
     "forwarding target. This drives cron-job skill-reference migration — "
@@ -790,7 +791,7 @@ def _extract_absorbed_into_declarations(
                 continue
         if not isinstance(args, dict):
             continue
-        if args.get("action") != "delete":
+        if args.get("action") not in ("delete", "archive"):
             continue
         name = args.get("name")
         if not isinstance(name, str) or not name.strip():
@@ -862,7 +863,7 @@ def _reconcile_classification(
                 entry: Dict[str, Any] = {
                     "name": name,
                     "into": into_claim,
-                    "source": "absorbed_into (model-declared at delete)",
+                    "source": "absorbed_into (model-declared at archive/delete)",
                     "reason": (mc.get("reason") or "") if mc else "",
                 }
                 if hc and hc.get("evidence"):
@@ -1860,10 +1861,19 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         # terminal. The background-thread runner also hides it; this
         # belt-and-suspenders path matters when a caller invokes
         # run_curator_review(synchronous=True) from the CLI.
-        with open(os.devnull, "w", encoding="utf-8") as _devnull, \
-             contextlib.redirect_stdout(_devnull), \
-             contextlib.redirect_stderr(_devnull):
-            conv_result = review_agent.run_conversation(user_message=prompt)
+        #
+        # Set the curator-review ContextVar so skill_manage knows to refuse
+        # action='delete' (permanent loss) and require action='archive'
+        # (recoverable move to .archive/) during this pass.
+        from tools import skill_provenance as _prov
+        _cur_token = _prov.mark_curator_review()
+        try:
+            with open(os.devnull, "w", encoding="utf-8") as _devnull, \
+                 contextlib.redirect_stdout(_devnull), \
+                 contextlib.redirect_stderr(_devnull):
+                conv_result = review_agent.run_conversation(user_message=prompt)
+        finally:
+            _prov.clear_curator_review(_cur_token)
 
         final = ""
         if isinstance(conv_result, dict):
